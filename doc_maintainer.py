@@ -25,14 +25,45 @@ class TranslationAction(Action):
     {content}
     """
     
-    async def run(self, content: str, source_lang: str, target_lang: str):
-        return await self._aask(
-            self.PROMPT_TEMPLATE.format(
-                content=content,
-                source_lang=source_lang,
-                target_lang=target_lang
+    IMPROVEMENT_PROMPT_TEMPLATE: ClassVar[str] = """
+    请改进以下{target_lang}翻译文档，使其更准确地反映{source_lang}原文内容。
+    
+    原文({source_lang}):
+    {source_content}
+    
+    现有翻译({target_lang}):
+    {target_content}
+    
+    要求:
+    1. 保留现有翻译中正确且合适的部分
+    2. 修正不准确或不恰当的翻译部分
+    3. 补充原文中有但翻译中缺失的内容
+    4. 保持原文的所有格式、标记和结构
+    
+    请输出完整的改进后文档，而不只是更改的部分：
+    """
+    
+    async def run(self, content: str, source_lang: str, target_lang: str, existing_translation: str = None):
+        """执行翻译，如有现有翻译则进行改进而非重新翻译"""
+        if existing_translation:
+            # 如果有现有翻译，使用改进模式
+            return await self._aask(
+                self.IMPROVEMENT_PROMPT_TEMPLATE.format(
+                    source_content=content,
+                    source_lang=source_lang,
+                    target_content=existing_translation,
+                    target_lang=target_lang
+                )
             )
-        )
+        else:
+            # 没有现有翻译，进行全新翻译
+            return await self._aask(
+                self.PROMPT_TEMPLATE.format(
+                    content=content,
+                    source_lang=source_lang,
+                    target_lang=target_lang
+                )
+            )
 
 class GenerateDocAction(Action):
     """生成缺失文档的Action"""
@@ -71,6 +102,150 @@ class GenerateDocAction(Action):
                     filtered_content = self._remove_tags(translated_content)
                     target_path.write_text(filtered_content, encoding='utf-8')
 
+class CompareDocumentAction(Action):
+    """简化的文档比较，只检查是否有差异，不记录具体位置"""
+    
+    DOCUMENT_COMPARISON_PROMPT: ClassVar[str] = """
+    请比较以下两种语言版本的文档，找出差异类型：
+    
+    ## 源文档 ({source_lang}):
+    {source_content}
+    
+    ## 目标文档 ({target_lang}):
+    {target_content}
+    
+    ## 要求:
+    1. 检查目标文档是否有缺失内容（整段落、部分段落或任何内容缺失）
+    2. 检查目标文档的翻译是否存在不准确或不恰当的部分
+    
+    ## 返回格式:
+    请直接返回JSON格式的结果，不要包含其他解释：
+    {{
+        "has_missing_content": true/false,
+        "has_translation_issues": true/false,
+        "needs_improvement": true/false  // 如果上面任一为true，则此项为true
+    }}
+    """
+    
+    def _remove_tags(self, content: str) -> str:
+        """使用正则表达式去除特定标记"""
+        return re.sub(r'<think>[^<]*?</think>', '', content, flags=re.DOTALL)
+    
+    async def run(self, source_path: Path, target_path: Path, source_lang: str, target_lang: str):
+        """比较两个文档，检查是否有差异
+        
+        Returns:
+            Dict: 包含差异类型的字典
+        """
+        source_content = source_path.read_text(encoding='utf-8')
+        target_content = target_path.read_text(encoding='utf-8')
+        
+        # 使用LLM进行文档比较
+        comparison_response = await self._aask(
+            self.DOCUMENT_COMPARISON_PROMPT.format(
+                source_lang=source_lang,
+                source_content=source_content,
+                target_lang=target_lang,
+                target_content=target_content
+            )
+        )
+        
+        # 处理LLM返回的结果
+        try:
+            # 移除特定标签
+            cleaned_response = self._remove_tags(comparison_response)
+            
+            # 尝试解析JSON
+            import json
+            import re
+            
+            # 尝试直接解析或提取JSON
+            try:
+                result = json.loads(cleaned_response)
+            except json.JSONDecodeError:
+                # 尝试提取JSON部分
+                json_match = re.search(r'\{(?:[^{}]|(?:\{[^{}]*\}))*\}', cleaned_response)
+                if json_match:
+                    try:
+                        result = json.loads(json_match.group(0))
+                    except json.JSONDecodeError:
+                        raise ValueError("无法解析提取的JSON内容")
+                else:
+                    raise ValueError("响应中找不到有效的JSON格式")
+            
+            # 确保结果包含所有必需的键
+            required_keys = ["has_missing_content", "has_translation_issues", "needs_improvement"]
+            for key in required_keys:
+                if key not in result:
+                    if key == "needs_improvement":
+                        result[key] = result.get("has_missing_content", False) or result.get("has_translation_issues", False)
+                    else:
+                        result[key] = False
+                    
+            return result
+            
+        except Exception as e:
+            print(f"解析比较结果失败: {e}")
+            print(f"原始响应: {comparison_response[:200]}...")
+            
+            # 返回默认结构
+            return {
+                "has_missing_content": False,
+                "has_translation_issues": False,
+                "needs_improvement": False,
+                "error": str(e)
+            }
+
+class DocumentSynchronizationAction(Action):
+    """简化的文档同步，直接使用原文和现有翻译进行完整翻译/改进"""
+    
+    def _remove_tags(self, content: str) -> str:
+        """使用正则表达式去除特定标记"""
+        return re.sub(r'<think>[^<]*?</think>', '', content, flags=re.DOTALL)
+    
+    async def run(self, comparison_result: Dict, source_path: Path, target_path: Path, 
+                  source_lang: str, target_lang: str):
+        """根据比较结果同步文档内容
+        
+        Args:
+            comparison_result: CompareDocumentAction返回的比较结果
+            source_path: 源文档路径
+            target_path: 目标文档路径
+            source_lang: 源语言
+            target_lang: 目标语言
+        
+        Returns:
+            bool: 是否进行了更改
+        """
+        # 如果不需要改进，直接返回
+        if not comparison_result.get("needs_improvement", False):
+            return False
+            
+        source_content = source_path.read_text(encoding='utf-8')
+        
+        # 如果目标文件存在，则读取现有翻译，否则为None
+        existing_translation = None
+        if target_path.exists():
+            existing_translation = target_path.read_text(encoding='utf-8')
+            
+        # 翻译或改进文档
+        translation = await TranslationAction().run(
+            source_content,
+            source_lang,
+            target_lang,
+            existing_translation
+        )
+        
+        # 移除特定标签
+        cleaned_translation = self._remove_tags(translation)
+        
+        # 写入更新后的翻译
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(cleaned_translation, encoding='utf-8')
+        
+        print(f"  ✓ 已{'更新' if existing_translation else '创建'}文件: {target_path}")
+        return True
+
 class ExtractContentBlocksAction(Action):
     """从文档中提取代码块和文本段落"""
     
@@ -95,295 +270,6 @@ class ExtractContentBlocksAction(Action):
                 paragraphs.append(block)
         
         return code_blocks, paragraphs
-
-class CompareDocumentAction(Action):
-    """整体比较两个语言版本的文档"""
-    
-    DOCUMENT_COMPARISON_PROMPT: ClassVar[str] = """
-    请比较以下两种语言版本的文档，找出差异并按照指定格式返回：
-    
-    ## 源文档 ({source_lang}):
-    {source_content}
-    
-    ## 目标文档 ({target_lang}):
-    {target_content}
-    
-    ## 要求:
-    1. 首先详细检查目标文档中是否有缺失的段落或内容
-       - 包括单个段落、连续多个段落、整节内容或任何缺失部分
-       - 标记所有缺失内容，即使是大段落或从某处开始的所有后续内容
-    2. 其次检查目标文档中的代码块与源文档是否完全一致（忽略注释内容）
-    3. 最后分析目标文档的内容是否有语义上的偏差
-    
-    ## 返回格式:
-    请直接返回JSON格式的结果，不要包含其他解释。严格遵循以下JSON结构，确保JSON格式正确无误且可以被解析:
-    {{
-        "missing_content": [
-            {{
-                "type": "paragraph/section/code/heading",
-                "source_content": "源文档中的内容",
-                "position_hint": "在目标文档中的位置提示（如：在某段落之后）"
-            }}
-        ],
-        "code_differences": [
-            {{
-                "source_block": "源代码块",
-                "target_block": "目标代码块", 
-                "position": "在目标文档中的位置"
-            }}
-        ],
-        "semantic_differences": [
-            {{
-                "source_paragraph": "源段落",
-                "target_paragraph": "目标段落",
-                "analysis": "差异分析",
-                "position": "在目标文档中的位置"
-            }}
-        ]
-    }}
-    
-    <注意>
-    如果源文档有大量内容缺失，请按照逻辑段落或部分将其拆分成多个缺失项，而不是一次性返回整个文档。尝试标识文档中的主要部分，如引言、各个章节等，并将它们作为独立的缺失项标记。这样更容易进行后续翻译和整合。
-    </注意>
-    
-    如果某个类别没有差异，请返回空列表。请提供完全有效的JSON，不含任何额外文本、导语或解释。
-    """
-    
-    def _remove_tags(self, content: str) -> str:
-        """使用正则表达式去除特定标记"""
-        return re.sub(r'<think>[^<]*?</think>', '', content, flags=re.DOTALL)
-    
-    async def run(self, source_path: Path, target_path: Path, source_lang: str, target_lang: str):
-        """比较两个文档的整体内容差异
-        
-        Returns:
-            Dict: 包含文档级别差异的字典
-        """
-        source_content = source_path.read_text(encoding='utf-8')
-        target_content = target_path.read_text(encoding='utf-8')
-        
-        # 使用LLM进行整体文档比较
-        comparison_response = await self._aask(
-            self.DOCUMENT_COMPARISON_PROMPT.format(
-                source_lang=source_lang,
-                source_content=source_content,
-                target_lang=target_lang,
-                target_content=target_content
-            )
-        )
-        
-        # 处理LLM返回的结果
-        try:
-            # 首先移除 <think> 和 </think> 标签
-            cleaned_response = self._remove_tags(comparison_response)
-            
-            # 更严格的JSON提取方法
-            import json
-            import re
-            
-            # 1. 尝试直接解析整个响应
-            try:
-                result = json.loads(cleaned_response)
-                
-            # 2. 如果直接解析失败，尝试提取JSON部分
-            except json.JSONDecodeError:
-                # 尝试查找最外层的花括号对
-                json_match = re.search(r'\{(?:[^{}]|(?:\{[^{}]*\}))*\}', cleaned_response)
-                if json_match:
-                    try:
-                        result = json.loads(json_match.group(0))
-                    except json.JSONDecodeError:
-                        # 如果仍然失败，进行更简单的清理并再次尝试
-                        json_str = json_match.group(0)
-                        # 移除可能的格式问题并处理转义字符
-                        json_str = re.sub(r'\\(?!["\\/bfnrtu])', '', json_str)
-                        try:
-                            result = json.loads(json_str)
-                        except json.JSONDecodeError:
-                            raise ValueError("无法解析提取的JSON内容")
-                else:
-                    raise ValueError("响应中找不到有效的JSON格式")
-            
-            # 确保结果包含所有必需的键
-            required_keys = ["missing_content", "code_differences", "semantic_differences"]
-            for key in required_keys:
-                if key not in result:
-                    result[key] = []
-                    
-            return result
-            
-        except Exception as e:
-            print(f"解析比较结果失败: {e}")
-            print(f"原始响应: {comparison_response[:200]}...")
-            
-            # 返回默认结构
-            return {
-                "missing_content": [],
-                "code_differences": [],
-                "semantic_differences": [],
-                "error": str(e)
-            }
-
-class DocumentSynchronizationAction(Action):
-    """基于整体文档比较结果同步文档内容"""
-    
-    CONTENT_TRANSLATION_PROMPT: ClassVar[str] = """
-    请将以下{source_lang}内容翻译为{target_lang}，保持技术准确性和原文风格:
-    
-    {content}
-    """
-    
-    CODE_BLOCK_TRANSLATION_PROMPT: ClassVar[str] = """
-    以下是一个代码块。请不要翻译代码本身，但是将注释从{source_lang}翻译为{target_lang}。
-    保持代码结构、变量名和函数名完全不变:
-    
-    {code_block}
-    """
-    
-    DOCUMENT_UPDATE_PROMPT: ClassVar[str] = """
-    请根据以下指示更新目标文档:
-    
-    ## 原始文档 ({target_lang}):
-    {original_document}
-    
-    ## 需要添加的内容:
-    {content_to_add}
-    
-    ## 需要替换的内容:
-    原内容: {content_to_replace}
-    新内容: {replacement_content}
-    
-    ## 位置提示:
-    {position_hint}
-    
-    请返回完整的更新后文档，保持原格式和结构。
-    """
-    
-    async def run(self, differences: Dict, source_path: Path, target_path: Path, 
-                  source_lang: str, target_lang: str):
-        """根据文档级别的差异同步文档内容
-        
-        Args:
-            differences: CompareDocumentAction返回的差异信息
-            source_path: 源文档路径
-            target_path: 目标文档路径
-            source_lang: 源语言
-            target_lang: 目标语言
-        """
-        # 检查是否需要同步
-        if (not differences.get("missing_content") and 
-            not differences.get("code_differences") and 
-            not differences.get("semantic_differences")):
-            return False  # 无需修改
-        
-        target_content = target_path.read_text(encoding='utf-8')
-        source_content = source_path.read_text(encoding='utf-8')
-        updated_content = target_content
-        changes_made = False
-        
-        # 处理缺失内容
-        if differences.get("missing_content"):
-            print(f"  - 处理缺失内容: {len(differences['missing_content'])} 项")
-            for item in differences["missing_content"]:
-                source_content_piece = item["source_content"]
-                position_hint = item.get("position_hint", "文档末尾")
-                
-                # 翻译缺失内容
-                translated_content = await self._aask(
-                    self.CONTENT_TRANSLATION_PROMPT.format(
-                        source_lang=source_lang,
-                        target_lang=target_lang,
-                        content=source_content_piece
-                    )
-                )
-                
-                # 使用LLM将翻译的内容添加到适当位置
-                updated_content = await self._aask(
-                    self.DOCUMENT_UPDATE_PROMPT.format(
-                        target_lang=target_lang,
-                        original_document=updated_content,
-                        content_to_add=translated_content,
-                        content_to_replace="",  # 无需替换
-                        replacement_content="",  # 无需替换
-                        position_hint=position_hint
-                    )
-                )
-                changes_made = True
-        
-        # 处理代码差异
-        if differences.get("code_differences"):
-            print(f"  - 处理代码差异: {len(differences['code_differences'])} 项")
-            for item in differences["code_differences"]:
-                source_block = item["source_block"]
-                target_block = item["target_block"]
-                position = item.get("position", "")
-                
-                # 对于代码块，我们保留原代码，但翻译注释
-                if any(line.strip().startswith(('/', '#', '<!--')) for line in source_block.splitlines()):
-                    # 有注释，需要翻译
-                    translated_block = await self._aask(
-                        self.CODE_BLOCK_TRANSLATION_PROMPT.format(
-                            source_lang=source_lang,
-                            target_lang=target_lang,
-                            code_block=source_block
-                        )
-                    )
-                else:
-                    # 无注释，直接使用源代码块
-                    translated_block = source_block
-                
-                # 使用LLM替换目标文档中的代码块
-                if target_block:  # 替换现有代码块
-                    updated_content = await self._aask(
-                        self.DOCUMENT_UPDATE_PROMPT.format(
-                            target_lang=target_lang,
-                            original_document=updated_content,
-                            content_to_add="",  # 无需添加
-                            content_to_replace=f"```{target_block}```",
-                            replacement_content=f"```{translated_block}```",
-                            position_hint=position
-                        )
-                    )
-                changes_made = True
-        
-        # 处理语义差异
-        if differences.get("semantic_differences"):
-            print(f"  - 处理语义差异: {len(differences['semantic_differences'])} 项")
-            for item in differences["semantic_differences"]:
-                source_para = item["source_paragraph"]
-                target_para = item["target_paragraph"]
-                position = item.get("position", "")
-                
-                # 重新翻译源段落
-                translated_para = await self._aask(
-                    self.CONTENT_TRANSLATION_PROMPT.format(
-                        source_lang=source_lang,
-                        target_lang=target_lang,
-                        content=source_para
-                    )
-                )
-                
-                # 使用LLM替换目标文档中的段落
-                updated_content = await self._aask(
-                    self.DOCUMENT_UPDATE_PROMPT.format(
-                        target_lang=target_lang,
-                        original_document=updated_content,
-                        content_to_add="",  # 无需添加
-                        content_to_replace=target_para,
-                        replacement_content=translated_para,
-                        position_hint=position
-                    )
-                )
-                changes_made = True
-        
-        # 如果有变更，写入文件
-        if changes_made:
-            # 移除<think>和</think>标记及其中的内容
-            updated_content = re.sub(r'<think>[^<]*?</think>', '', updated_content, flags=re.DOTALL)
-            target_path.write_text(updated_content, encoding='utf-8')
-            print(f"  ✓ 已更新文件: {target_path}")
-        
-        return changes_made
 
 class DocMaintainer(Role):
     """文档维护主角色"""
@@ -452,26 +338,33 @@ class DocMaintainer(Role):
                 target_path = base_path / target_lang / file
                 print(f"比较文档: {file} ({primary_lang} → {target_lang})")
                 
-                # 使用整体文档比较而不是逐段比较
-                differences = await CompareDocumentAction().run(
+                # 简化的比较逻辑
+                comparison_result = await CompareDocumentAction().run(
                     source_path, 
                     target_path, 
                     primary_lang, 
                     target_lang
                 )
                 
-                # 如果有差异，进行同步
-                if (differences.get("missing_content") or 
-                    differences.get("code_differences") or 
-                    differences.get("semantic_differences")):
-                    print(f"发现差异，同步文件: {file} ({target_lang})")
+                # 根据比较结果输出信息
+                if comparison_result.get("needs_improvement"):
+                    issues = []
+                    if comparison_result.get("has_missing_content"):
+                        issues.append("内容缺失")
+                    if comparison_result.get("has_translation_issues"):
+                        issues.append("翻译问题")
+                    print(f"  发现问题: {', '.join(issues)}")
+                    
+                    # 执行文档同步
                     await DocumentSynchronizationAction().run(
-                        differences,
+                        comparison_result,
                         source_path,
                         target_path,
                         primary_lang,
                         target_lang
                     )
+                else:
+                    print(f"  ✓ 文档已同步")
 
 async def main():
     maintainer = DocMaintainer()
