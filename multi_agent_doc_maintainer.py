@@ -15,6 +15,27 @@ import re
 import json
 import asyncio
 from improved_doc_analyzer import DocAnalyzer
+import logging
+from datetime import datetime
+from colorama import Fore, Style, init
+import argparse
+import sys
+
+# Initialize colorama to support Windows color output
+init()
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger('MultiAgentDocMaintainer')
+
+# Add file handler to write logs to file
+file_handler = logging.FileHandler('multi_agent_doc_maintainer.log')
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.addHandler(file_handler)
 
 # Shared Actions that might be used by both agents
 class ExtractContentBlocksAction(Action):
@@ -47,11 +68,14 @@ class CheckDocStructureAction(Action):
         structure = {}
         for lang in lang_dirs:
             lang_path = base_path / lang
-            if lang_path.exists():
-                files = [str(p.relative_to(lang_path)) for p in lang_path.rglob('*.md')]
-                structure[lang] = set(files)
-            else:
+            if not lang_path.exists():
+                logger.warning(f"{Fore.YELLOW}Language directory doesn't exist: {lang_path}{Style.RESET_ALL}")
                 structure[lang] = set()
+                continue
+                
+            files = [str(p.relative_to(lang_path)) for p in lang_path.rglob('*.md')]
+            structure[lang] = set(files)
+            logger.info(f"{Fore.GREEN}Scanned {lang} directory: found {len(files)} documents{Style.RESET_ALL}")
         return structure
 
 class CompareDocumentAction(Action):
@@ -81,10 +105,12 @@ class CompareDocumentAction(Action):
     
     def _remove_tags(self, content: str) -> str:
         """Remove specific tags using regex"""
-        return re.sub(r'<think>[^<]*?</think>', '', content, flags=re.DOTALL)
+        return re.sub(r'<think>[^<]*?</think>\n\n', '', content, flags=re.DOTALL)
     
     async def run(self, source_path: Path, target_path: Path, source_lang: str, target_lang: str):
         """Compare two documents and check for differences"""
+        logger.debug(f"Comparing documents: {source_path.name} ({source_lang} vs {target_lang})")
+        
         # Use DocAnalyzer for additional checks
         analyzer = DocAnalyzer()
         
@@ -134,6 +160,8 @@ class CompareDocumentAction(Action):
                             result[key] = False
             except Exception as e:
                 # Fallback to analyzer results
+                logger.error(f"{Fore.RED}Failed to parse comparison result: {e}{Style.RESET_ALL}")
+                logger.debug(f"Original response: {comparison_response[:200]}...")
                 result = {
                     "has_missing_content": missing_content,
                     "has_translation_issues": translation_issues,
@@ -184,10 +212,11 @@ class TranslationAction(Action):
     
     def _remove_tags(self, content: str) -> str:
         """Remove specific tags using regex"""
-        return re.sub(r'<think>[^<]*?</think>', '', content, flags=re.DOTALL)
+        return re.sub(r'<think>[^<]*?</think>\n\n', '', content, flags=re.DOTALL)
     
     async def run(self, content: str, source_lang: str, target_lang: str, existing_translation: str = None):
         """Execute translation or improve existing translation"""
+        logger.info(f"Executing {Fore.BLUE}{'translation improvement' if existing_translation else 'new translation'}{Style.RESET_ALL}: {source_lang} → {target_lang}")
         if existing_translation:
             # Improvement mode with existing translation
             result = await self._aask(
@@ -291,7 +320,7 @@ class DocumentChecker(Role):
     
     async def run_document_check(self, base_path: Path, lang_dirs: list, primary_lang: str = "en"):
         """Run full document structure and content check"""
-        print("🔍 Document Checker: Starting document check...")
+        logger.info(f"{Fore.CYAN}🔍 Document Checker: Starting document check...{Style.RESET_ALL}")
         
         # Check structure
         structure, missing_files = await self.check_doc_structure(base_path, lang_dirs)
@@ -299,8 +328,9 @@ class DocumentChecker(Role):
         # Check content of existing files
         content_results = await self.check_doc_content(base_path, structure, primary_lang)
         
-        print(f"🔍 Document Checker: Found {sum(len(files) for files in missing_files.values())} missing files")
-        print(f"🔍 Document Checker: Completed {len(content_results)} content comparisons")
+        total_missing = sum(len(files) for files in missing_files.values())
+        logger.info(f"{Fore.YELLOW}🔍 Document Checker: Found {total_missing} missing files{Style.RESET_ALL}")
+        logger.info(f"{Fore.GREEN}🔍 Document Checker: Completed {len(content_results)} content comparisons{Style.RESET_ALL}")
         
         # Return complete results
         return {
@@ -312,7 +342,7 @@ class DocumentChecker(Role):
     async def process_and_request_translations(self, check_results, base_path: Path):
         """Process check results and request translations when needed"""
         if not self.translator_role:
-            print("❌ Document Checker: No translator role set!")
+            logger.error(f"{Fore.RED}❌ Document Checker: No translator role set!{Style.RESET_ALL}")
             return
             
         # Process missing files first
@@ -363,7 +393,7 @@ class DocumentChecker(Role):
                 )
                 improvement_count += 1
         
-        print(f"🔍 Document Checker: Requested {missing_count} new translations and {improvement_count} translation improvements")
+        logger.info(f"{Fore.GREEN}🔍 Document Checker: Requested {missing_count} new translations and {improvement_count} translation improvements{Style.RESET_ALL}")
 
 class DocumentTranslator(Role):
     """Document Translator Role - handles translation and translation improvement"""
@@ -380,7 +410,7 @@ class DocumentTranslator(Role):
                                         target_lang: str, target_path: Path, 
                                         existing_translation: Optional[str] = None):
         """Handle translation request from the checker"""
-        print(f"🌐 Document Translator: Received {'improvement' if existing_translation else 'translation'} request for {target_path}")
+        logger.info(f"{Fore.BLUE}🌐 Document Translator: Received {'improvement' if existing_translation else 'translation'} request for {target_path}{Style.RESET_ALL}")
         
         # Perform translation or improvement
         result = await TranslationAction().run(
@@ -397,10 +427,10 @@ class DocumentTranslator(Role):
         # Update counters
         if existing_translation:
             self.improvements_completed += 1
-            print(f"🌐 Document Translator: Improved translation saved to {target_path}")
+            logger.info(f"{Fore.GREEN}🌐 Document Translator: Improved translation saved to {target_path}{Style.RESET_ALL}")
         else:
             self.translations_completed += 1
-            print(f"🌐 Document Translator: New translation saved to {target_path}")
+            logger.info(f"{Fore.GREEN}🌐 Document Translator: New translation saved to {target_path}{Style.RESET_ALL}")
         
         return {
             "target_path": target_path,
@@ -416,50 +446,99 @@ class DocumentTranslator(Role):
         }
 
 # Main coordinator function
-async def run_document_maintenance(base_path: Path, lang_dirs: list, primary_lang: str = "en"):
+async def run_document_maintenance(base_path: Path, lang_dirs: list, primary_lang: str = "en", dry_run: bool = False, verbose: bool = False):
     """Run the document maintenance process with multiple agents"""
-    print(f"📚 Starting Multi-Agent Document Maintenance for {base_path}")
-    print(f"   Languages: {', '.join(lang_dirs)}")
-    print(f"   Primary Language: {primary_lang}")
+    if verbose:
+        logger.setLevel(logging.DEBUG)
+    
+    logger.info(f"{Fore.CYAN}========================================{Style.RESET_ALL}")
+    logger.info(f"{Fore.CYAN}📚 Starting Multi-Agent Document Maintenance{Style.RESET_ALL}")
+    logger.info(f"{Fore.CYAN}Base path: {base_path}{Style.RESET_ALL}")
+    logger.info(f"{Fore.CYAN}Languages: {', '.join(lang_dirs)}{Style.RESET_ALL}")
+    logger.info(f"{Fore.CYAN}Primary Language: {primary_lang}{Style.RESET_ALL}")
+    
+    if dry_run:
+        logger.info(f"{Fore.YELLOW}[DRY RUN MODE] No files will be modified{Style.RESET_ALL}")
+    
+    logger.info(f"{Fore.CYAN}========================================{Style.RESET_ALL}")
+    
+    start_time = datetime.now()
     
     # Create the agents
     translator = DocumentTranslator()
     checker = DocumentChecker()
     checker.set_translator(translator)
     
-    # Run the document check
-    check_results = await checker.run_document_check(base_path, lang_dirs, primary_lang)
+    try:
+        # Run the document check
+        check_results = await checker.run_document_check(base_path, lang_dirs, primary_lang)
+        
+        # Process results and request translations
+        if not dry_run:
+            await checker.process_and_request_translations(check_results, base_path)
+        else:
+            logger.info(f"{Fore.YELLOW}[DRY RUN] Would have processed translation requests{Style.RESET_ALL}")
+        
+        # Get final status
+        translator_status = await translator.get_status()
+        
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        
+        logger.info(f"{Fore.CYAN}========================================{Style.RESET_ALL}")
+        logger.info(f"{Fore.CYAN}📊 Document Maintenance Summary (Duration: {duration:.1f}s):{Style.RESET_ALL}")
+        logger.info(f"   - New Translations: {translator_status['translations_completed']}")
+        logger.info(f"   - Improved Translations: {translator_status['improvements_completed']}")
+        logger.info(f"   - Total Files Processed: {translator_status['translations_completed'] + translator_status['improvements_completed']}")
+        logger.info(f"{Fore.CYAN}========================================{Style.RESET_ALL}")
+        
+        return check_results, translator_status
+    except Exception as e:
+        logger.error(f"{Fore.RED}Error during document maintenance: {e}{Style.RESET_ALL}")
+        import traceback
+        logger.debug(traceback.format_exc())
+        return {"error": str(e)}, {"error": str(e)}
+
+def setup_argparse():
+    """Set up command line argument parsing"""
+    parser = argparse.ArgumentParser(
+        description="Multi-Agent Document Maintenance System - Check and synchronize multi-language documentation",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     
-    # Process results and request translations
-    await checker.process_and_request_translations(check_results, base_path)
-    
-    # Get final status
-    translator_status = await translator.get_status()
-    
-    print("\n📊 Document Maintenance Summary:")
-    print(f"   New Translations: {translator_status['translations_completed']}")
-    print(f"   Improved Translations: {translator_status['improvements_completed']}")
-    print(f"   Total Files Processed: {translator_status['translations_completed'] + translator_status['improvements_completed']}")
-    
-    return check_results, translator_status
+    parser.add_argument("-p", "--path", type=str, default="./test",
+                      help="Base path for documentation")
+                      
+    parser.add_argument("-l", "--langs", type=str, default="en,zh",
+                      help="Comma-separated language directories")
+                      
+    parser.add_argument("-m", "--primary", type=str, default="en",
+                      help="Primary language for comparisons")
+                      
+    parser.add_argument("-v", "--verbose", action="store_true",
+                      help="Display verbose output")
+                      
+    parser.add_argument("-d", "--dry-run", action="store_true",
+                      help="Dry run mode, don't modify files")
+                      
+    return parser
 
 # Example usage
 if __name__ == "__main__":
     async def main():
-        # Example usage with command-line arguments
-        import argparse
-        
-        parser = argparse.ArgumentParser(description="Multi-Agent Document Maintenance System")
-        parser.add_argument("--path", type=str, default="./test", help="Base path for documentation")
-        parser.add_argument("--langs", type=str, default="en,zh", help="Comma-separated language directories")
-        parser.add_argument("--primary", type=str, default="en", help="Primary language for comparisons")
-        
+        parser = setup_argparse()
         args = parser.parse_args()
         
         base_path = Path(args.path)
         lang_dirs = args.langs.split(",")
         primary_lang = args.primary
         
-        await run_document_maintenance(base_path, lang_dirs, primary_lang)
+        await run_document_maintenance(
+            base_path,
+            lang_dirs,
+            primary_lang,
+            args.dry_run,
+            args.verbose
+        )
     
     asyncio.run(main())
