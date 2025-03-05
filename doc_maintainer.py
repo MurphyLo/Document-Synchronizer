@@ -189,7 +189,7 @@ class CompareDocumentAction(Action):
     """比较文档并识别差异"""
     
     DOCUMENT_COMPARISON_PROMPT: ClassVar[str] = """
-    请比较以下两种语言版本的文档，找出差异类型：
+    请比较以下两种语言版本的文档，判断是否存在显著差异：
     
     ## 源文档 ({source_lang}):
     {source_content}
@@ -198,15 +198,13 @@ class CompareDocumentAction(Action):
     {target_content}
     
     ## 要求:
-    1. 检查目标文档是否有缺失内容（整段落、部分段落或任何内容缺失）
-    2. 检查目标文档的翻译是否存在不准确或不恰当的部分
+    1. 检查两个文档之间是否存在有意义的差异
+    2. 一旦发现明显差异，立即停止分析
     
     ## 返回格式:
     请直接返回JSON格式的结果，不要包含其他解释：
     {{
-        "has_missing_content": true/false,
-        "has_translation_issues": true/false,
-        "needs_improvement": true/false  // 如果上面任一为true，则此项为true
+        "has_differences": true/false
     }}
     """
     
@@ -218,7 +216,7 @@ class CompareDocumentAction(Action):
         """比较两个文档，检查是否有差异
         
         Returns:
-            Dict: 包含差异类型的字典
+            Dict: 包含差异结果的字典
         """
         logger.debug(f"比较文档: {source_path.name} ({source_lang} vs {target_lang})")
         source_content = source_path.read_text(encoding='utf-8')
@@ -253,14 +251,9 @@ class CompareDocumentAction(Action):
                 else:
                     raise ValueError("响应中找不到有效的JSON格式")
             
-            # 确保结果包含所有必需的键
-            required_keys = ["has_missing_content", "has_translation_issues", "needs_improvement"]
-            for key in required_keys:
-                if key not in result:
-                    if key == "needs_improvement":
-                        result[key] = result.get("has_missing_content", False) or result.get("has_translation_issues", False)
-                    else:
-                        result[key] = False
+            # 确保结果包含必需的键
+            if "has_differences" not in result:
+                result["has_differences"] = False
                     
             return result
             
@@ -270,9 +263,7 @@ class CompareDocumentAction(Action):
             
             # 返回默认结构
             return {
-                "has_missing_content": False,
-                "has_translation_issues": False,
-                "needs_improvement": False,
+                "has_differences": False,
                 "error": str(e)
             }
 
@@ -299,16 +290,10 @@ class DocumentSynchronizationAction(Action):
             bool: 是否进行了更改
         """
         # 如果不需要改进，直接返回
-        if not comparison_result.get("needs_improvement", False):
+        if not comparison_result.get("has_differences", False):
             return False
             
-        issues = []
-        if comparison_result.get("has_missing_content"):
-            issues.append("内容缺失")
-        if comparison_result.get("has_translation_issues"):
-            issues.append("翻译不准确")
-            
-        logger.info(f"{Fore.YELLOW}文档需要改进: {target_path.name} - 问题: {', '.join(issues)}{Style.RESET_ALL}")
+        logger.info(f"{Fore.YELLOW}文档需要改进: {target_path.name} - 发现差异{Style.RESET_ALL}")
         
         if dry_run:
             logger.info(f"{Fore.YELLOW}[模拟] 将改进文档: {target_path}{Style.RESET_ALL}")
@@ -339,30 +324,6 @@ class DocumentSynchronizationAction(Action):
         logger.info(f"{Fore.GREEN}✓ {'更新' if existing_translation else '创建'}文件: {target_path}{Style.RESET_ALL}")
         return True
 
-class ExtractContentBlocksAction(Action):
-    """从文档中提取代码块和文本段落"""
-    
-    async def run(self, content: str):
-        """提取文档中的代码块和文本段落
-        
-        Returns:
-            Tuple[List[str], List[str]]: 代码块列表和文本段落列表
-        """
-        # 提取代码块 (```开始和结束的区块)
-        code_block_pattern = r'```[^\n]*\n(.*?)```'
-        code_blocks = re.findall(code_block_pattern, content, re.DOTALL)
-        
-        # 替换掉代码块后提取文本段落 (连续的非空行)
-        content_without_code = re.sub(code_block_pattern, '[CODE_BLOCK]', content, flags=re.DOTALL)
-        
-        # 按照空行分割文本，获取段落
-        paragraphs = []
-        for block in re.split(r'\n\s*\n', content_without_code):
-            block = block.strip()
-            if block and '[CODE_BLOCK]' not in block:
-                paragraphs.append(block)
-        
-        return code_blocks, paragraphs
 
 class DocMaintainer(Role):
     """文档维护主角色"""
@@ -394,7 +355,6 @@ class DocMaintainer(Role):
             CheckDocStructureAction,
             TranslationAction, 
             GenerateDocAction,
-            ExtractContentBlocksAction,
             CompareDocumentAction,
             DocumentSynchronizationAction
         ])
@@ -504,7 +464,7 @@ class DocMaintainer(Role):
                 )
                 
                 # 处理比较结果
-                if comparison_result.get("needs_improvement"):
+                if comparison_result.get("has_differences", False):
                     files_to_improve += 1
                     self.stats["files_to_improve"] += 1
                     

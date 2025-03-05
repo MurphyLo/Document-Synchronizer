@@ -14,7 +14,6 @@ from typing import ClassVar, Dict, List, Tuple, Set, Optional
 import re
 import json
 import asyncio
-from improved_doc_analyzer import DocAnalyzer
 import logging
 from datetime import datetime
 from colorama import Fore, Style, init
@@ -37,27 +36,6 @@ file_handler = logging.FileHandler('multi_agent_doc_maintainer.log')
 file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(file_handler)
 
-# Shared Actions that might be used by both agents
-class ExtractContentBlocksAction(Action):
-    """Extract code blocks and text paragraphs from a document"""
-    
-    async def run(self, content: str):
-        """Extract code blocks and text paragraphs from the document"""
-        # Extract code blocks (sections between ``` markers)
-        code_block_pattern = r'```[^\n]*\n(.*?)```'
-        code_blocks = re.findall(code_block_pattern, content, re.DOTALL)
-        
-        # Replace code blocks then extract text paragraphs (consecutive non-empty lines)
-        content_without_code = re.sub(code_block_pattern, '[CODE_BLOCK]', content, flags=re.DOTALL)
-        
-        # Split by empty lines to get paragraphs
-        paragraphs = []
-        for block in re.split(r'\n\s*\n', content_without_code):
-            block = block.strip()
-            if block and '[CODE_BLOCK]' not in block:
-                paragraphs.append(block)
-        
-        return code_blocks, paragraphs
 
 # Document Checker Actions
 class CheckDocStructureAction(Action):
@@ -82,7 +60,7 @@ class CompareDocumentAction(Action):
     """Compare documents and identify differences"""
     
     DOCUMENT_COMPARISON_PROMPT: ClassVar[str] = """
-    Compare the following documents in two languages and identify difference types:
+    Compare the following documents in two languages and determine if there are any significant differences:
     
     ## Source Document ({source_lang}):
     {source_content}
@@ -91,15 +69,13 @@ class CompareDocumentAction(Action):
     {target_content}
     
     ## Requirements:
-    1. Check if the target document is missing any content (whole paragraphs, parts of paragraphs, or any content)
-    2. Check if the target document's translation has any inaccurate or inappropriate parts
+    1. Check if there are any meaningful differences between the documents
+    2. Stop analysis as soon as you find a clear difference
     
     ## Return Format:
     Return only the JSON result without any additional explanation:
     {{
-        "has_missing_content": true/false,
-        "has_translation_issues": true/false,
-        "needs_improvement": true/false  // true if either of the above is true
+        "has_differences": true/false
     }}
     """
     
@@ -111,74 +87,52 @@ class CompareDocumentAction(Action):
         """Compare two documents and check for differences"""
         logger.debug(f"Comparing documents: {source_path.name} ({source_lang} vs {target_lang})")
         
-        # Use DocAnalyzer for additional checks
-        analyzer = DocAnalyzer()
-        
         source_content = source_path.read_text(encoding='utf-8')
         target_content = target_path.read_text(encoding='utf-8')
         
-        # Basic analysis with DocAnalyzer
-        missing_content = analyzer.is_missing_significant_content(source_content, target_content)
-        translation_issues = analyzer.check_common_translation_issues(source_content, target_content)
-        similarity = analyzer.calculate_similarity(source_content, target_content)
-        
-        # For more detailed analysis, use LLM
-        if similarity < 0.95:  # Only use LLM for documents with significant differences
-            comparison_response = await self._aask(
-                self.DOCUMENT_COMPARISON_PROMPT.format(
-                    source_lang=source_lang,
-                    source_content=source_content,
-                    target_lang=target_lang,
-                    target_content=target_content
-                )
+        # Use LLM for document comparison
+        comparison_response = await self._aask(
+            self.DOCUMENT_COMPARISON_PROMPT.format(
+                source_lang=source_lang,
+                source_content=source_content,
+                target_lang=target_lang,
+                target_content=target_content
             )
+        )
+        
+        # Process LLM response
+        try:
+            # Clean and parse response
+            cleaned_response = self._remove_tags(comparison_response)
             
             try:
-                # Clean and parse response
-                cleaned_response = self._remove_tags(comparison_response)
-                
-                try:
-                    result = json.loads(cleaned_response)
-                except json.JSONDecodeError:
-                    # Try to extract JSON portion
-                    json_match = re.search(r'\{(?:[^{}]|(?:\{[^{}]*\}))*\}', cleaned_response)
-                    if json_match:
-                        try:
-                            result = json.loads(json_match.group(0))
-                        except json.JSONDecodeError:
-                            raise ValueError("Cannot parse extracted JSON content")
-                    else:
-                        raise ValueError("Cannot find valid JSON format in response")
-                
-                # Ensure all required keys are present
-                required_keys = ["has_missing_content", "has_translation_issues", "needs_improvement"]
-                for key in required_keys:
-                    if key not in result:
-                        if key == "needs_improvement":
-                            result[key] = result.get("has_missing_content", False) or result.get("has_translation_issues", False)
-                        else:
-                            result[key] = False
-            except Exception as e:
-                # Fallback to analyzer results
-                logger.error(f"{Fore.RED}Failed to parse comparison result: {e}{Style.RESET_ALL}")
-                logger.debug(f"Original response: {comparison_response[:200]}...")
-                result = {
-                    "has_missing_content": missing_content,
-                    "has_translation_issues": translation_issues,
-                    "needs_improvement": missing_content or translation_issues or similarity < 0.8,
-                    "error": str(e)
-                }
-        else:
-            # Use analyzer results directly for high similarity documents
-            result = {
-                "has_missing_content": missing_content,
-                "has_translation_issues": translation_issues,
-                "needs_improvement": missing_content or translation_issues
-            }
+                result = json.loads(cleaned_response)
+            except json.JSONDecodeError:
+                # Try to extract JSON portion
+                json_match = re.search(r'\{(?:[^{}]|(?:\{[^{}]*\}))*\}', cleaned_response)
+                if json_match:
+                    try:
+                        result = json.loads(json_match.group(0))
+                    except json.JSONDecodeError:
+                        raise ValueError("Cannot parse extracted JSON content")
+                else:
+                    raise ValueError("Cannot find valid JSON format in response")
             
-        # Add similarity score for reference
-        result["similarity"] = similarity
-        return result
+            # Ensure the required key is present
+            if "has_differences" not in result:
+                result["has_differences"] = False
+                        
+            return result
+            
+        except Exception as e:
+            # Return default structure on error
+            logger.error(f"{Fore.RED}Failed to parse comparison result: {e}{Style.RESET_ALL}")
+            logger.debug(f"Original response: {comparison_response[:200]}...")
+            
+            return {
+                "has_differences": False,
+                "error": str(e)
+            }
 
 # Document Translator Actions
 class TranslationAction(Action):
@@ -317,7 +271,7 @@ class DocumentChecker(Role):
                 })
         
         return results
-    
+        
     async def run_document_check(self, base_path: Path, lang_dirs: list, primary_lang: str = "en"):
         """Run full document structure and content check"""
         logger.info(f"{Fore.CYAN}🔍 Document Checker: Starting document check...{Style.RESET_ALL}")
@@ -376,7 +330,7 @@ class DocumentChecker(Role):
         # Then process content improvements
         improvement_count = 0
         for result in check_results["content_results"]:
-            if result["comparison"].get("needs_improvement", False):
+            if result["comparison"].get("has_differences", False):
                 source_path = result["source_path"]
                 target_path = result["target_path"]
                 
@@ -472,6 +426,11 @@ async def run_document_maintenance(base_path: Path, lang_dirs: list, primary_lan
     try:
         # Run the document check
         check_results = await checker.run_document_check(base_path, lang_dirs, primary_lang)
+        
+        # Log files needing improvement
+        differences_count = sum(1 for result in check_results["content_results"] 
+                            if result["comparison"].get("has_differences", False))
+        logger.info(f"{Fore.YELLOW}🔍 Document Checker: Found {differences_count} files with differences{Style.RESET_ALL}")
         
         # Process results and request translations
         if not dry_run:
