@@ -465,7 +465,7 @@ def setup_argparse():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    parser.add_argument("-p", "--path", type=str, default="./test",
+    parser.add_argument("-p", "--path", type=str, default="./examples",
                       help="Base path for documentation")
                       
     parser.add_argument("-l", "--langs", type=str, default="en,zh",

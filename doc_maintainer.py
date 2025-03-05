@@ -541,7 +541,7 @@ def setup_argparse():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    parser.add_argument("-p", "--path", type=str, default="./test",
+    parser.add_argument("-p", "--path", type=str, default="./examples",
                       help="文档根目录路径")
                       
     parser.add_argument("-l", "--langs", type=str, default="en,zh",
