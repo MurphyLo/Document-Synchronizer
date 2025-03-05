@@ -8,11 +8,9 @@ python doc_maintainer.py --path ./docs --langs en,zh,es --primary en
 from metagpt.actions import Action
 from metagpt.roles import Role
 from pathlib import Path
-from difflib import Differ
-from typing import ClassVar, Dict, List, Tuple, Set, Optional
+from typing import ClassVar, Dict, List
 import re
 import json
-import sys
 import argparse
 import asyncio
 import logging
@@ -26,14 +24,37 @@ init()
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[]  # Remove default handlers since we'll add custom ones
 )
 logger = logging.getLogger('DocMaintainer')
 
-# 添加文件处理器以将日志写入到文件
+
+# 添加流处理器以将日志输出到终端（保留颜色）
+stream_handler = logging.StreamHandler()
+stream_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+stream_handler.setFormatter(stream_formatter)
+logger.addHandler(stream_handler)
+
+
+# 创建一个过滤器来移除ANSI颜色代码
+class ColorStripper(logging.Filter):
+    def filter(self, record):
+        if isinstance(record.msg, str):
+            # 移除ANSI颜色代码
+            ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+            record.msg = ansi_escape.sub('', record.msg)
+        return True
+
+# 添加文件处理器以将日志写入到文件（无颜色）
 file_handler = logging.FileHandler('doc_maintainer.log')
-file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+file_handler.addFilter(ColorStripper())  # 添加颜色过滤器
 logger.addHandler(file_handler)
+
+# 设置日志级别
+logger.setLevel(logging.INFO)
 
 # Action类定义
 class CheckDocStructureAction(Action):
@@ -86,7 +107,7 @@ class TranslationAction(Action):
     
     async def run(self, content: str, source_lang: str, target_lang: str, existing_translation: str = None):
         """执行翻译，如有现有翻译则进行改进而非重新翻译"""
-        logger.info(f"执行{'翻译改进' if existing_translation else '新翻译'}: {source_lang} → {target_lang}")
+        logger.info(f"{Fore.BLUE}🌐 执行{'翻译改进' if existing_translation else '新翻译'}: {source_lang} → {target_lang}{Style.RESET_ALL}")
         
         if existing_translation:
             # 如果有现有翻译，使用改进模式
@@ -380,7 +401,7 @@ class DocMaintainer(Role):
     
     async def check_and_generate_docs(self):
         """检查并生成缺失的文档"""
-        logger.info(f"{Fore.CYAN}开始检查文档结构: {self.base_path}{Style.RESET_ALL}")
+        logger.info(f"{Fore.CYAN}🔍 开始检查文档结构: {self.base_path}{Style.RESET_ALL}")
         
         # 1. 检查文档结构
         structure = await CheckDocStructureAction().run(self.base_path, self.lang_dirs)
@@ -394,7 +415,7 @@ class DocMaintainer(Role):
             logger.info(f"{Fore.YELLOW}发现 {total_missing} 个缺失文件{Style.RESET_ALL}")
             for lang, files in missing_files.items():
                 if files:
-                    logger.info(f"  {lang}: 缺少 {len(files)} 个文件")
+                    logger.info(f"  {Fore.YELLOW}{lang}: 缺少 {len(files)} 个文件{Style.RESET_ALL}")
                     if self.verbose:
                         for f in files:
                             logger.debug(f"    - {f}")
@@ -421,7 +442,7 @@ class DocMaintainer(Role):
     
     async def synchronize_doc_content(self, structure: dict):
         """同步文档内容，更新不一致的翻译"""
-        logger.info(f"{Fore.CYAN}开始检查文档内容一致性{Style.RESET_ALL}")
+        logger.info(f"{Fore.CYAN}✨ 开始检查文档内容一致性{Style.RESET_ALL}")
         
         # 获取所有共有的文件
         common_files = {}
@@ -433,7 +454,7 @@ class DocMaintainer(Role):
             if len(langs) > 1:  # 至少两种语言都有这个文件
                 common_files[file] = langs
         
-        logger.info(f"共有 {len(common_files)} 个文件需要检查内容一致性")
+        logger.info(f"{Fore.CYAN}共有 {len(common_files)} 个文件需要检查内容一致性{Style.RESET_ALL}")
         
         # 比较每个共有文件在不同语言版本间的内容差异
         files_to_improve = 0
@@ -497,7 +518,7 @@ class DocMaintainer(Role):
         """运行完整的文档维护流程"""
         start_time = datetime.now()
         logger.info(f"{Fore.CYAN}========================================{Style.RESET_ALL}")
-        logger.info(f"{Fore.CYAN}开始文档维护流程{Style.RESET_ALL}")
+        logger.info(f"{Fore.CYAN}📚 开始文档维护{Style.RESET_ALL}")
         logger.info(f"{Fore.CYAN}文档目录: {self.base_path}{Style.RESET_ALL}")
         logger.info(f"{Fore.CYAN}语言: {', '.join(self.lang_dirs)}{Style.RESET_ALL}")
         logger.info(f"{Fore.CYAN}主要语言: {self.primary_lang}{Style.RESET_ALL}")
@@ -517,14 +538,14 @@ class DocMaintainer(Role):
             duration = (end_time - start_time).total_seconds()
             
             logger.info(f"{Fore.CYAN}========================================{Style.RESET_ALL}")
-            logger.info(f"{Fore.CYAN}文档维护完成 (耗时: {duration:.1f}秒){Style.RESET_ALL}")
+            logger.info(f"{Fore.CYAN}📊 文档维护完成 (耗时: {duration:.1f}秒){Style.RESET_ALL}")
             logger.info(f"{Fore.CYAN}统计信息:{Style.RESET_ALL}")
-            logger.info(f"  - 发现缺失文件: {self.stats['missing_files']} 个")
-            logger.info(f"  - 发现需改进文件: {self.stats['files_to_improve']} 个")
+            logger.info(f"{Fore.BLUE}  - 发现缺失文件: {self.stats['missing_files']} 个{Style.RESET_ALL}")
+            logger.info(f"{Fore.BLUE}  - 发现需改进文件: {self.stats['files_to_improve']} 个{Style.RESET_ALL}")
             
             if not self.dry_run:
-                logger.info(f"  - 创建新文件: {self.stats['files_created']} 个")
-                logger.info(f"  - 改进文件: {self.stats['files_improved']} 个")
+                logger.info(f"{Fore.BLUE}  - 创建新文件: {self.stats['files_created']} 个{Style.RESET_ALL}")
+                logger.info(f"{Fore.BLUE}  - 改进文件: {self.stats['files_improved']} 个{Style.RESET_ALL}")
             logger.info(f"{Fore.CYAN}========================================{Style.RESET_ALL}")
             
             return self.stats

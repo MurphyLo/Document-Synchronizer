@@ -8,9 +8,8 @@ Contains two roles:
 
 from metagpt.actions import Action
 from metagpt.roles import Role
-from metagpt.schema import Message
 from pathlib import Path
-from typing import ClassVar, Dict, List, Tuple, Set, Optional
+from typing import ClassVar, Dict, Set, Optional
 import re
 import json
 import asyncio
@@ -18,7 +17,6 @@ import logging
 from datetime import datetime
 from colorama import Fore, Style, init
 import argparse
-import sys
 
 # Initialize colorama to support Windows color output
 init()
@@ -27,14 +25,37 @@ init()
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[]  # Remove default handlers since we'll add custom ones
 )
 logger = logging.getLogger('MultiAgentDocMaintainer')
 
-# Add file handler to write logs to file
+
+# Create a console handler with color support
+stream_handler = logging.StreamHandler()
+stream_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+stream_handler.setFormatter(stream_formatter)
+logger.addHandler(stream_handler)
+
+
+# Filter to remove ANSI color codes from log messages
+class ColorStripper(logging.Filter):
+    def filter(self, record):
+        if isinstance(record.msg, str):
+            # Remove ANSI color codes
+            ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+            record.msg = ansi_escape.sub('', record.msg)
+        return True
+
+# Create a file handler for logging to a file
 file_handler = logging.FileHandler('multi_agent_doc_maintainer.log')
-file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+file_handler.addFilter(ColorStripper())  # 添加颜色过滤器
 logger.addHandler(file_handler)
+
+# 设置日志级别
+logger.setLevel(logging.INFO)
 
 
 # Document Checker Actions
@@ -446,9 +467,9 @@ async def run_document_maintenance(base_path: Path, lang_dirs: list, primary_lan
         
         logger.info(f"{Fore.CYAN}========================================{Style.RESET_ALL}")
         logger.info(f"{Fore.CYAN}📊 Document Maintenance Summary (Duration: {duration:.1f}s):{Style.RESET_ALL}")
-        logger.info(f"   - New Translations: {translator_status['translations_completed']}")
-        logger.info(f"   - Improved Translations: {translator_status['improvements_completed']}")
-        logger.info(f"   - Total Files Processed: {translator_status['translations_completed'] + translator_status['improvements_completed']}")
+        logger.info(f"{Fore.BLUE}   - New Translations: {translator_status['translations_completed']}{Style.RESET_ALL}")
+        logger.info(f"{Fore.BLUE}   - Improved Translations: {translator_status['improvements_completed']}{Style.RESET_ALL}")
+        logger.info(f"{Fore.BLUE}   - Total Files Processed: {translator_status['translations_completed'] + translator_status['improvements_completed']}{Style.RESET_ALL}")
         logger.info(f"{Fore.CYAN}========================================{Style.RESET_ALL}")
         
         return check_results, translator_status
